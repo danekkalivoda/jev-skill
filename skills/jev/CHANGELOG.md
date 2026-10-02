@@ -1,5 +1,12 @@
 # Changelog
 
+All notable changes to the jev skill. Newest first.
+
+## Unreleased
+
+- Move the changelog into the skill folder so installed copies include it.
+- Add `AGENTS.md` with the rules for logging changes and releasing.
+
 ## 1.1.0
 
 - Add `skill_hint` per task: a separate Jev Choice request runs in parallel and names an installed skill when confidence is at least 0.7.

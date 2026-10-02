@@ -33,4 +33,4 @@ Set `JEV_LOG` to write somewhere else.
 
 ## Versions
 
-Releases are git tags `vX.Y.Z`. See [CHANGELOG.md](CHANGELOG.md).
+Releases are git tags `vX.Y.Z`. See [skills/jev/CHANGELOG.md](skills/jev/CHANGELOG.md).
