@@ -38,6 +38,9 @@ You do not pick models by feel. That is the point of this skill: orchestrators p
    - `clarify_first: true` - the brief is too vague. Sharpen it from what you know, or ask the user. Then route again.
    - `escalate_to_user: true` - it already failed on the top tier. Stop and ask the user.
    - otherwise spawn it (see "Spawning" below).
+   `skill_hint` is optional advice: an installed skill that may fit the task, or null.
+   If it fits, tell the subagent to load that skill. Skip it when it conflicts with the brief
+   (for example a skill that writes files for a read-only task).
 5. **Verify** each result yourself, cheaply: read the diff, run the relevant check. Do not trust a subagent's "done".
    `risky` of 0.7 or more means verification is mandatory and should be thorough.
 6. **On failure**, route the same task again with `"attempt": 1` (then 2). Code raises the tier by one per attempt.

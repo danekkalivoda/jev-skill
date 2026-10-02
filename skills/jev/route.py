@@ -3,7 +3,8 @@
 
 Input (stdin, JSON):
   {"tasks": [{"id": "a", "brief": "English task description", "attempt": 0, "min_tier": null, "min_tier_reason": null}]}
-Output (stdout, JSON): one decision per task, with the model to use in Claude Code and in Codex.
+Output (stdout, JSON): one decision per task, with the model to use in Claude Code and in Codex,
+plus "skill_hint": {"name", "confidence"} naming an installed skill the sub-agent could load, or null.
 
 Jev only judges the task. Code owns the policy: coverage threshold, floors, retries, model table.
 Stdlib only, so it runs the same under Claude Code, Codex, or any other agent.
@@ -18,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -27,6 +29,7 @@ TIERS = CONFIG["tiers"]
 MAX_TIER = len(TIERS) - 1
 LOG = Path(os.environ.get("JEV_LOG", Path.home() / ".local/state/jev/decisions.jsonl"))
 API = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = CONFIG["jev_model"]
 
 STATE = "An orchestrator is delegating a task to an AI coding sub-agent working in a software repository."
 
@@ -116,7 +119,7 @@ def ask_jev(tasks: list[dict]) -> dict:
     questions: dict = {}
     for task in tasks:
         questions.update(questions_for(task))
-    body = json.dumps({"state": STATE, "model": "jev-latest", "questions": questions}).encode()
+    body = json.dumps({"state": STATE, "model": JEV_MODEL, "questions": questions}).encode()
     request = urllib.request.Request(
         API,
         data=body,
@@ -137,6 +140,115 @@ def ask_jev(tasks: list[dict]) -> dict:
     raise RuntimeError(f"Jev request failed: {last_error}")
 
 
+SKILL_STATE_INTRO = "An orchestrator is delegating a task to an AI coding sub-agent. Task brief:\n\n"
+SKILL_NONE = "none"
+SKILL_HINT_GRACE_SECONDS = 0.5
+SKILL_NONE_DESC = "No special skill. Ordinary implementation, edits, fixes, searches and reading named files."
+SKILL_QUESTION = (
+    "A sub-agent will do the task in `state`. Pick a skill only if its instructions are written specifically for this kind of work "
+    "and would change how the agent does it. If the task is an ordinary code change, search or fix that a capable coding agent does "
+    "without special instructions, pick none."
+)
+
+
+def skill_frontmatter(path: Path) -> dict | None:
+    """name, description and disable-model-invocation from a SKILL.md header (simple YAML subset)."""
+    match = re.match(r"^---\s*\n(.*?)\n---", path.read_text(encoding="utf-8", errors="ignore"), re.S)
+    if not match:
+        return None
+    lines, out, i = match.group(1).split("\n"), {}, 0
+    while i < len(lines):
+        key_match = re.match(r"^(name|description|disable-model-invocation):\s*(.*)$", lines[i])
+        i += 1
+        if not key_match:
+            continue
+        key, value = key_match.group(1), key_match.group(2).strip()
+        if value in (">", "|", ">-", "|-", ">+", "|+"):
+            parts = []
+            while i < len(lines) and (lines[i].startswith(" ") or not lines[i].strip()):
+                parts.append(lines[i].strip())
+                i += 1
+            value = " ".join(part for part in parts if part)
+        elif value[:1] in "\"'" and len(value) > 1:
+            quote = value[0]
+            while not (len(value) > 1 and value.endswith(quote)) and i < len(lines):
+                value += " " + lines[i].strip()
+                i += 1
+            value = value[1:-1] if value.endswith(quote) else value[1:]
+            if quote == '"':
+                value = value.replace('\\"', '"')
+        if key == "disable-model-invocation":
+            out[key] = value.strip("\"'").lower() == "true"
+            continue
+        out[key] = re.sub(r"\s+", " ", value).strip()
+    return out
+
+
+def installed_skills() -> dict[str, str]:
+    """Skills a sub-agent could load, name -> description. Skips jev and skills the model may not invoke itself."""
+    roots = [Path.home() / ".claude/skills", Path.home() / ".agents/skills", Path.cwd() / ".claude/skills", Path.cwd() / ".agents/skills"]
+    skills: dict[str, str] = {}
+    excluded: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*/SKILL.md")):
+            try:
+                meta = skill_frontmatter(path)
+            except OSError:
+                continue
+            name = (meta or {}).get("name")
+            if not name or name == "jev":
+                continue
+            if meta.get("disable-model-invocation"):
+                excluded.add(name)
+                continue
+            description = meta.get("description", "")
+            if name not in skills or len(description) > len(skills[name]):
+                skills[name] = description
+    for name in excluded:
+        skills.pop(name, None)
+    return skills
+
+
+def short_description(text: str, limit: int = 600) -> str:
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def ask_skill_hint(key: str, brief: str, criteria: dict[str, str], deadline: float) -> dict | None:
+    """One Choice question per task. Best effort: one retry at most, never past the deadline, any error gives None."""
+    try:
+        body = json.dumps({
+            "state": SKILL_STATE_INTRO + brief,
+            "model": JEV_MODEL,
+            "questions": {"skill": {"type": "choice", "instructions": SKILL_QUESTION, "criteria": criteria}},
+        }).encode()
+        for _ in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.2:
+                return None
+            request = urllib.request.Request(
+                API, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=remaining) as response:
+                    answer = json.loads(response.read())["answers"]["skill"]
+                break
+            except urllib.error.HTTPError as error:
+                if error.code not in (429, 529, 500, 502, 503):
+                    return None
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+        else:
+            return None
+        name, confidence = answer["choice"], round(float(answer["confidence"]), 2)
+        if name == SKILL_NONE or name not in criteria or confidence < POLICY["skill_hint_confidence"]:
+            return None
+        return {"name": name, "confidence": confidence}
+    except Exception:
+        return None
+
+
 def smallest_covering_tier(probabilities: dict[str, float]) -> int:
     """Cheapest tier k where P(needed tier <= k) reaches the coverage threshold."""
     cumulative = 0.0
@@ -147,7 +259,7 @@ def smallest_covering_tier(probabilities: dict[str, float]) -> int:
     return MAX_TIER
 
 
-def decide(task: dict, answers: dict | None, error: str | None) -> dict:
+def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict | None = None) -> dict:
     tid = task["id"]
     reasons: list[str] = []
     risky = unclear = None
@@ -211,6 +323,7 @@ def decide(task: dict, answers: dict | None, error: str | None) -> dict:
         "escalate_to_user": escalate_to_user,
         "reasons": reasons,
         "probabilities": None if answers is None else {k: round(v, 2) for k, v in probabilities.items()},
+        "skill_hint": None if answers is None else skill_hint,
     }
 
 
@@ -228,12 +341,31 @@ def main() -> int:
 
     started = time.monotonic()
     answers = error = model = None
+    # Skill hints run in parallel with the tier request. They are optional: errors become null, and they get
+    # only their own short deadline, so they can never change or noticeably delay the tier output.
+    skill_deadline = started + POLICY["skill_hint_timeout_seconds"]
+    pool = ThreadPoolExecutor(max_workers=len(tasks) + 1)
+    hint_futures: dict = {}
     try:
-        response = ask_jev(tasks)
+        key = load_key()
+        skills = installed_skills() if key else {}
+        if skills:
+            criteria = {name: short_description(text) or "(no description)" for name, text in sorted(skills.items())}
+            criteria[SKILL_NONE] = SKILL_NONE_DESC
+            hint_futures = {task["id"]: pool.submit(ask_skill_hint, key, task["brief"], criteria, skill_deadline) for task in tasks}
+    except Exception:
+        hint_futures = {}
+    try:
+        response = pool.submit(ask_jev, tasks).result()
         answers, model = response["answers"], response.get("model")
     except Exception as exc:  # any failure falls back to the default tier, never blocks the orchestrator
         error = str(exc)
-    decisions = [decide(task, answers, error) for task in tasks]
+    if answers is not None:  # after the tier answer, wait at most a short grace (and never past the hint deadline)
+        hint_wait_until = min(skill_deadline, time.monotonic() + SKILL_HINT_GRACE_SECONDS)
+        wait(list(hint_futures.values()), timeout=max(0.0, hint_wait_until - time.monotonic()))
+    skill_hints = {tid: future.result() if future.done() and not future.exception() else None for tid, future in hint_futures.items()}
+    pool.shutdown(wait=False)
+    decisions = [decide(task, answers, error, skill_hints.get(task["id"])) for task in tasks]
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     output = {"source": "jev" if answers else "fallback", "jev_model": model, "ms": elapsed_ms, "decisions": decisions}
@@ -245,6 +377,10 @@ def main() -> int:
             log.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cwd": os.getcwd(), "tasks": tasks, **output}, ensure_ascii=False) + "\n")
     except OSError:
         pass
+    if any(not future.done() for future in hint_futures.values()):
+        # A late skill-hint request must not hold the process open (Python joins pool threads at exit).
+        sys.stdout.flush()
+        os._exit(0)
     return 0
 
 
