@@ -4,6 +4,8 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+## 1.1.1
+
 - Move the changelog into the skill folder so installed copies include it.
 - Add `AGENTS.md` with the rules for logging changes and releasing.
 
