@@ -1,5 +1,26 @@
 {
-  "jev_model": "jev-1.13.0",
+  "providers": {
+    "typesafe": {
+      "url": "https://api.typesafe.ai/v1/systemone",
+      "key_env": "TYPESAFE_API_KEY",
+      "model": "jev-1.13.0"
+    },
+    "openrouter": {
+      "url": "https://openrouter.ai/api/v1/systemone",
+      "key_env": "OPENROUTER_API_KEY",
+      "model": "typesafe/jev-1.13"
+    },
+    "local": {
+      "url_env": "JEV_LOCAL_URL",
+      "model": "nimble",
+      "max_choices": 26,
+      "one_question_per_request": true,
+      "policy": {
+        "low_confidence_threshold": 0,
+        "timeout_seconds": 15
+      }
+    }
+  },
   "tiers": [
     {
       "tier": 0,

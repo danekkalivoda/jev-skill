@@ -7,6 +7,7 @@ Output (stdout, JSON): one decision per task, with the model to use in Claude Co
 plus "skill_hint": {"name", "confidence"} naming an installed skill the sub-agent could load, or null.
 
 Jev only judges the task. Code owns the policy: coverage threshold, floors, retries, model table.
+JEV_PROVIDER picks who serves the judgment model: typesafe (default), openrouter, or local (see models.json).
 Stdlib only, so it runs the same under Claude Code, Codex, or any other agent.
 """
 
@@ -24,12 +25,31 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = json.loads((HERE / "models.json").read_text(encoding="utf-8"))
-POLICY = CONFIG["policy"]
+
+
+def load_setting(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value:
+        return value
+    # Agent shells often skip the interactive profile (Codex passes only core env vars), so read it directly.
+    pattern = re.compile(rf"""^\s*(?:export\s+)?{re.escape(name)}=["']?([^"'\s]+)""")
+    for profile in (".zshenv", ".zshrc", ".zprofile", ".bash_profile", ".profile"):
+        path = Path.home() / profile
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                match = pattern.match(line)
+                if match:
+                    return match.group(1)
+    return None
+
+
+PROVIDER_NAME = (load_setting("JEV_PROVIDER") or "typesafe").lower()
+PROVIDER = CONFIG["providers"].get(PROVIDER_NAME)  # None for an unknown name; endpoint() reports it
+# A provider may override policy numbers, because thresholds calibrated on one model do not carry over to another.
+POLICY = {**CONFIG["policy"], **(PROVIDER or {}).get("policy", {})}
 TIERS = CONFIG["tiers"]
 MAX_TIER = len(TIERS) - 1
 LOG = Path(os.environ.get("JEV_LOG", Path.home() / ".local/state/jev/decisions.jsonl"))
-API = "https://api.typesafe.ai/v1/systemone"
-JEV_MODEL = CONFIG["jev_model"]
 
 STATE = "An orchestrator is delegating a task to an AI coding sub-agent working in a software repository."
 
@@ -49,20 +69,20 @@ TIER_LEVELS = [
 ]
 
 
-def load_key() -> str | None:
-    key = os.environ.get("TYPESAFE_API_KEY")
-    if key:
-        return key
-    # Agent shells often skip the interactive profile (Codex passes only core env vars), so read it directly.
-    pattern = re.compile(r"""^\s*(?:export\s+)?TYPESAFE_API_KEY=["']?([^"'\s]+)""")
-    for name in (".zshenv", ".zshrc", ".zprofile", ".bash_profile", ".profile"):
-        path = Path.home() / name
-        if path.is_file():
-            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                match = pattern.match(line)
-                if match:
-                    return match.group(1)
-    return None
+def endpoint() -> tuple[str, dict, str]:
+    """URL, headers and model of the chosen provider. Raises when the provider is unknown or not set up."""
+    if PROVIDER is None:
+        raise RuntimeError(f"unknown JEV_PROVIDER '{PROVIDER_NAME}' (known: {', '.join(CONFIG['providers'])})")
+    headers = {"Content-Type": "application/json"}
+    url = PROVIDER.get("url") or load_setting(PROVIDER["url_env"])
+    if not url:
+        raise RuntimeError(f"{PROVIDER['url_env']} not found in env or shell profile")
+    if "key_env" in PROVIDER:
+        key = load_setting(PROVIDER["key_env"])
+        if not key:
+            raise RuntimeError(f"{PROVIDER['key_env']} not found in env or shell profile")
+        headers["Authorization"] = f"Bearer {key}"
+    return url, headers, PROVIDER["model"]
 
 
 def latest_codex_model(family: str) -> str:
@@ -113,18 +133,25 @@ def questions_for(task: dict) -> dict:
 
 
 def ask_jev(tasks: list[dict]) -> dict:
-    key = load_key()
-    if not key:
-        raise RuntimeError("TYPESAFE_API_KEY not found in env or shell profile")
+    target = endpoint()
     questions: dict = {}
     for task in tasks:
         questions.update(questions_for(task))
-    body = json.dumps({"state": STATE, "model": JEV_MODEL, "questions": questions}).encode()
-    request = urllib.request.Request(
-        API,
-        data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
+    if not PROVIDER.get("one_question_per_request"):
+        return post_questions(target, questions)
+    # Some servers put all questions of a request into one prompt, so the answers sway each other and a big wave
+    # overflows the context. One question per request keeps each rating independent of the rest of the wave.
+    answers: dict = {}
+    for name, question in questions.items():
+        response = post_questions(target, {name: question})
+        answers.update(response["answers"])
+    return {"answers": answers, "model": response.get("model")}
+
+
+def post_questions(target: tuple[str, dict, str], questions: dict) -> dict:
+    url, headers, model = target
+    body = json.dumps({"state": STATE, "model": model, "questions": questions}).encode()
+    request = urllib.request.Request(url, data=body, headers=headers)
     last_error: Exception | None = None
     for attempt in range(3):
         try:
@@ -215,21 +242,20 @@ def short_description(text: str, limit: int = 600) -> str:
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "..."
 
 
-def ask_skill_hint(key: str, brief: str, criteria: dict[str, str], deadline: float) -> dict | None:
+def ask_skill_hint(target: tuple[str, dict, str], brief: str, criteria: dict[str, str], deadline: float) -> dict | None:
     """One Choice question per task. Best effort: one retry at most, never past the deadline, any error gives None."""
     try:
+        url, headers, model = target
         body = json.dumps({
             "state": SKILL_STATE_INTRO + brief,
-            "model": JEV_MODEL,
+            "model": model,
             "questions": {"skill": {"type": "choice", "instructions": SKILL_QUESTION, "criteria": criteria}},
         }).encode()
         for _ in range(2):
             remaining = deadline - time.monotonic()
             if remaining <= 0.2:
                 return None
-            request = urllib.request.Request(
-                API, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-            )
+            request = urllib.request.Request(url, data=body, headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=remaining) as response:
                     answer = json.loads(response.read())["answers"]["skill"]
@@ -347,12 +373,13 @@ def main() -> int:
     pool = ThreadPoolExecutor(max_workers=len(tasks) + 1)
     hint_futures: dict = {}
     try:
-        key = load_key()
-        skills = installed_skills() if key else {}
-        if skills:
+        target = endpoint()
+        skills = installed_skills()
+        # Some providers cap the number of choices; the hint is optional, so it is skipped rather than cut down.
+        if skills and len(skills) < PROVIDER.get("max_choices", 255):
             criteria = {name: short_description(text) or "(no description)" for name, text in sorted(skills.items())}
             criteria[SKILL_NONE] = SKILL_NONE_DESC
-            hint_futures = {task["id"]: pool.submit(ask_skill_hint, key, task["brief"], criteria, skill_deadline) for task in tasks}
+            hint_futures = {task["id"]: pool.submit(ask_skill_hint, target, task["brief"], criteria, skill_deadline) for task in tasks}
     except Exception:
         hint_futures = {}
     try:
@@ -368,7 +395,7 @@ def main() -> int:
     decisions = [decide(task, answers, error, skill_hints.get(task["id"])) for task in tasks]
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    output = {"source": "jev" if answers else "fallback", "jev_model": model, "ms": elapsed_ms, "decisions": decisions}
+    output = {"source": "jev" if answers else "fallback", "provider": PROVIDER_NAME, "jev_model": model, "ms": elapsed_ms, "decisions": decisions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
     try:

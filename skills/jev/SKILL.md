@@ -81,6 +81,8 @@ If you notice you are doing a task's real work, stop and delegate it.
 ## Files
 
 - `route.py` - calls Jev, applies policy, prints decisions, appends to `~/.local/state/jev/decisions.jsonl`.
+  The user's `JEV_PROVIDER` setting decides who serves the judgment model (`typesafe` by default, `openrouter`, or `local`);
+  the output field `provider` names it. Do not change the provider yourself. With `local` the low-confidence drop is off.
 - `models.json` - tier to model table and policy numbers (coverage 0.8, risky floor, thresholds).
   Models are named by family only, never by version: Claude aliases (`haiku`, `sonnet`, `opus`, `fable`) always mean the newest version,
   and Codex families (`luna`, `sol`, `astra`) resolve to the newest listed `gpt-N-<family>` in `~/.codex/models_cache.json`.

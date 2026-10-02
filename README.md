@@ -26,6 +26,26 @@ Set your TypeSafe API key in your shell profile (for example `~/.zshenv`):
 export TYPESAFE_API_KEY=...
 ```
 
+### Other providers
+
+TypeSafe is the default. Set `JEV_PROVIDER` in the same shell profile to use another one:
+
+| `JEV_PROVIDER` | Also set | Model |
+| --- | --- | --- |
+| `typesafe` (default) | `TYPESAFE_API_KEY` | Jev |
+| `openrouter` | `OPENROUTER_API_KEY` | Jev, billed to your OpenRouter account |
+| `local` | `JEV_LOCAL_URL` | [nimble](https://ollama.com/library/nimble) on your own machine |
+
+`JEV_LOCAL_URL` is the full address of a server that speaks the same System One API as Jev,
+for example `http://localhost:8080/v1/systemone`. No key is sent.
+
+The tier thresholds in `models.json` were calibrated on Jev. With `local` they are not calibrated yet,
+so treat its tiers as experimental. Skill hints are off for `local` when more than 25 skills are installed.
+`local` is also slower: it rates one question at a time, about 3 seconds per task on an M1 Max.
+
+If the chosen provider is not set up or not reachable, `route.py` does not switch to another one.
+It returns the fallback tier and says why.
+
 ## Decision log
 
 Every routing decision is appended to `~/.local/state/jev/decisions.jsonl`.

@@ -4,6 +4,12 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+- Add `JEV_PROVIDER` to choose who serves the judgment model: `typesafe` (default, unchanged), `openrouter` (`OPENROUTER_API_KEY`), or `local` (a System One compatible server at `JEV_LOCAL_URL`, model `nimble`).
+- Move the pinned model from `jev_model` to `providers` in `models.json`. A provider can override policy numbers.
+- `local` sends one question per request (questions sharing a request sway each other there and big waves overflow its context), skips the low-confidence drop, waits up to 15 s per question, and gives no skill hint when more than 25 skills are installed. Its tier thresholds are still the ones calibrated on Jev.
+- Add `provider` to the output and the decision log.
+- An unknown provider or a missing key or URL gives the usual fallback tier with the reason.
+
 ## 1.1.1
 
 - Move the changelog into the skill folder so installed copies include it.
