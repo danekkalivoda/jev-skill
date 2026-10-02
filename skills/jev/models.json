@@ -1,0 +1,62 @@
+{
+  "tiers": [
+    {
+      "tier": 0,
+      "label": "mechanical",
+      "claude": {
+        "model": "haiku"
+      },
+      "codex": {
+        "family": "luna",
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "tier": 1,
+      "label": "standard",
+      "claude": {
+        "model": "sonnet"
+      },
+      "codex": {
+        "family": "sol",
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "tier": 2,
+      "label": "hard",
+      "claude": {
+        "model": "opus"
+      },
+      "codex": {
+        "family": "sol",
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "tier": 3,
+      "label": "frontier",
+      "claude": {
+        "model": "fable"
+      },
+      "codex": {
+        "family": "astra",
+        "reasoning_effort": "xhigh"
+      }
+    }
+  ],
+  "policy": {
+    "coverage": 0.8,
+    "risky_floor_tier": 2,
+    "risky_threshold": 0.7,
+    "unclear_threshold": 0.9,
+    "fallback_tier": 1,
+    "timeout_seconds": 8,
+    "low_confidence_threshold": 0.3,
+    "standard_coverage": 0.15,
+    "standard_risky_guard": 0.4,
+    "frontier_coverage": 0.4,
+    "frontier_risky_guard": 0.7
+  },
+  "codex_fallback_generation": "6"
+}
