@@ -65,6 +65,11 @@ Use the column for the harness you are running in. Put the brief (plus any conte
 - When a task lands on tier 2 but Jev gives tier 0 or 1 a probability of `standard_coverage` (0.15) or more, `route.py` takes tier 1, unless `risky` is `standard_risky_guard` (0.4) or higher. Do not undo it with `min_tier` without a concrete reason.
 - When a task lands on tier 3 but Jev gives tiers 0-2 a probability of `frontier_coverage` (0.4) or more, `route.py` takes tier 2, unless `risky` is `frontier_risky_guard` (0.7) or higher. Same rule: no `min_tier` without a concrete reason.
 - You may raise a task: add `"min_tier": N, "min_tier_reason": "..."` to its input. The reason is logged. Use it rarely and say why.
+- The user's settings (`~/.config/jev/settings.json`, or the nearest `.jev.json` up from the working directory) can make routing more careful.
+  `quality` +1 or +2 keeps the drops above from firing; -1 or -2 lets more tasks take a cheaper tier.
+  A weighted topic (for example `security`) gets its own Jev question; the score is in `topics`, and a match blocks the drops (weight 1),
+  raises the task to tier 2 (weight 2), also to tier 3 when Jev gives tier 3 a real share (weight 3), or always to tier 3 (weight 4).
+  The output field `settings` shows what was applied. If `settings.warnings` is not empty, tell the user once. Do not edit the settings yourself.
 - If Jev is unreachable, `route.py` returns `"source": "fallback"` and tier 1 for everything. Tell the user once and continue.
 
 ## What you still do yourself

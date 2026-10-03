@@ -8,6 +8,7 @@ plus "skill_hint": {"name", "confidence"} naming an installed skill the sub-agen
 
 Jev only judges the task. Code owns the policy: coverage threshold, floors, retries, model table.
 JEV_PROVIDER picks who serves the judgment model: typesafe (default), openrouter, or local (see models.json).
+User settings (~/.config/jev/settings.json, .jev.json) can add a quality level and weighted topics; see README.
 Stdlib only, so it runs the same under Claude Code, Codex, or any other agent.
 """
 
@@ -43,10 +44,57 @@ def load_setting(name: str) -> str | None:
     return None
 
 
+def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
+    """Quality (-2..2), topics (name -> (weight 1..4, description)) and warnings from the user's settings files.
+
+    ~/.config/jev/settings.json (or JEV_SETTINGS) is read first, then the nearest .jev.json from the working
+    directory upwards, whose values win. No files means quality 0 and no topics: the default routing.
+    A bad file or value only adds a warning; it never stops a tier decision.
+    """
+    warnings: list[str] = []
+    paths = [Path(os.environ.get("JEV_SETTINGS") or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "jev/settings.json")]
+    for folder in [Path.cwd(), *Path.cwd().parents]:
+        if (folder / ".jev.json").is_file():
+            paths.append(folder / ".jev.json")
+            break
+    quality, raw_topics = 0, {}
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert isinstance(data, dict), "not a JSON object"
+        except (OSError, ValueError, AssertionError) as error:
+            warnings.append(f"{path}: ignored ({error})")
+            continue
+        if "quality" in data:
+            if isinstance(data["quality"], int) and not isinstance(data["quality"], bool) and -2 <= data["quality"] <= 2:
+                quality = data["quality"]
+            else:
+                warnings.append(f"{path}: quality must be a whole number from -2 to 2")
+        if isinstance(data.get("topics"), dict):
+            raw_topics.update(data["topics"])
+        elif "topics" in data:
+            warnings.append(f"{path}: topics must be an object")
+    topics: dict[str, tuple[int, str]] = {}
+    for name, value in raw_topics.items():
+        weight, description = (value.get("weight"), value.get("description")) if isinstance(value, dict) else (value, None)
+        description = description or CONFIG["topics"].get(name)
+        if not isinstance(weight, int) or isinstance(weight, bool) or not 0 <= weight <= 4:
+            warnings.append(f"topic {name}: weight must be a whole number from 0 to 4")
+        elif not description:
+            warnings.append(f"topic {name}: unknown topic needs a description")
+        elif weight:
+            topics[name] = (weight, description)
+    return quality, topics, warnings
+
+
 PROVIDER_NAME = (load_setting("JEV_PROVIDER") or "typesafe").lower()
 PROVIDER = CONFIG["providers"].get(PROVIDER_NAME)  # None for an unknown name; endpoint() reports it
+QUALITY, TOPICS, SETTINGS_WARNINGS = load_user_settings()
 # A provider may override policy numbers, because thresholds calibrated on one model do not carry over to another.
-POLICY = {**CONFIG["policy"], **(PROVIDER or {}).get("policy", {})}
+# The user's quality level goes on top: it trades cost for safety the same way on every provider.
+POLICY = {**CONFIG["policy"], **(PROVIDER or {}).get("policy", {}), **CONFIG["quality_levels"][str(QUALITY)]}
 TIERS = CONFIG["tiers"]
 MAX_TIER = len(TIERS) - 1
 LOG = Path(os.environ.get("JEV_LOG", Path.home() / ".local/state/jev/decisions.jsonl"))
@@ -104,6 +152,13 @@ def latest_codex_model(family: str) -> str:
 
 def questions_for(task: dict) -> dict:
     tid, brief = task["id"], task["brief"]
+    topics = {
+        f"topic:{name}:{tid}": {
+            "type": "noul",
+            "instructions": {"task": brief, "question": f"Does `task` involve {description}?"},
+        }
+        for name, (_, description) in TOPICS.items()
+    }
     return {
         f"tier:{tid}": {
             "type": "score",
@@ -129,6 +184,7 @@ def questions_for(task: dict) -> dict:
                 "because the goal, the scope, or the done condition is missing?",
             },
         },
+        **topics,
     }
 
 
@@ -290,6 +346,7 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
     reasons: list[str] = []
     risky = unclear = None
     score = confidence = None
+    topic_scores: dict[str, float] | None = None
     if answers is None:
         tier = POLICY["fallback_tier"]
         reasons.append(f"fallback: {error}")
@@ -306,20 +363,41 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
         # hard one on most benchmarks, so a modest chance of tier 1 is enough, unless the task is risky.
         standard_share = round(probabilities.get("0", 0.0) + probabilities.get("1", 0.0), 2)
         hard_share = round(standard_share + probabilities.get("2", 0.0), 2)
+        # The user's settings decide which tasks are too important for the cost-saving drops below.
+        topic_scores = {name: round(answers[f"topic:{name}:{tid}"]["noul"], 2) for name in TOPICS if f"topic:{name}:{tid}" in answers}
+        matched = [(TOPICS[name][0], name) for name, value in topic_scores.items() if value >= POLICY["topic_threshold"]]
+        topic_weight, topic = max(matched, default=(0, None))
+        if topic:
+            drop_blocker = f"topic {topic}"
+        elif not POLICY["allow_drops"]:
+            drop_blocker = f"quality +{QUALITY}"
+        else:
+            drop_blocker = None
+        drop = None
         if tier == 2 and standard_share >= POLICY["standard_coverage"] and risky < POLICY["standard_risky_guard"]:
-            tier = 1
-            reasons.append(f"P(tier <= 1) {standard_share} reaches {POLICY['standard_coverage']}: dropped to tier 1")
+            drop = (1, f"P(tier <= 1) {standard_share} reaches {POLICY['standard_coverage']}")
         # Same for tier 3: the frontier model costs 2.5x the hard one; keep it for risky tasks and clear frontier work.
         elif tier == 3 and hard_share >= POLICY["frontier_coverage"] and risky < POLICY["frontier_risky_guard"]:
-            tier = 2
-            reasons.append(f"P(tier <= 2) {hard_share} reaches {POLICY['frontier_coverage']}: dropped to tier 2")
+            drop = (2, f"P(tier <= 2) {hard_share} reaches {POLICY['frontier_coverage']}")
         # Low confidence means Jev is guessing; a guess must not buy the pricier model.
         elif confidence < POLICY["low_confidence_threshold"] and tier > 0:
-            tier -= 1
-            reasons.append(f"confidence {confidence} below {POLICY['low_confidence_threshold']}: dropped to tier {tier}")
+            drop = (tier - 1, f"confidence {confidence} below {POLICY['low_confidence_threshold']}")
+        if drop and drop_blocker:
+            reasons.append(f"{drop[1]}: kept tier {tier} ({drop_blocker})")
+        elif drop:
+            tier = drop[0]
+            reasons.append(f"{drop[1]}: dropped to tier {tier}")
         if risky >= POLICY["risky_threshold"] and tier < POLICY["risky_floor_tier"]:
             tier = POLICY["risky_floor_tier"]
             reasons.append(f"risky {risky}: raised to tier {tier}")
+        # Weight 1 only blocks the drops, 2 asks for the hard tier, 3 also takes frontier when Jev gives it
+        # a real share, 4 always takes frontier.
+        topic_floor = {1: 0, 2: 2, 3: 2, 4: MAX_TIER}.get(topic_weight, 0)
+        if topic_weight == 3 and probabilities.get(str(MAX_TIER), 0.0) >= POLICY["topic_frontier_share"]:
+            topic_floor = MAX_TIER
+        if tier < topic_floor:
+            tier = topic_floor
+            reasons.append(f"topic {topic} {topic_scores[topic]} (weight {topic_weight}): raised to tier {tier}")
 
     min_tier = task.get("min_tier")
     if isinstance(min_tier, int) and min_tier > tier:
@@ -349,6 +427,7 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
         "escalate_to_user": escalate_to_user,
         "reasons": reasons,
         "probabilities": None if answers is None else {k: round(v, 2) for k, v in probabilities.items()},
+        "topics": topic_scores or None,
         "skill_hint": None if answers is None else skill_hint,
     }
 
@@ -395,7 +474,8 @@ def main() -> int:
     decisions = [decide(task, answers, error, skill_hints.get(task["id"])) for task in tasks]
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    output = {"source": "jev" if answers else "fallback", "provider": PROVIDER_NAME, "jev_model": model, "ms": elapsed_ms, "decisions": decisions}
+    settings = {"quality": QUALITY, "topics": {name: weight for name, (weight, _) in TOPICS.items()}, "warnings": SETTINGS_WARNINGS}
+    output = {"source": "jev" if answers else "fallback", "provider": PROVIDER_NAME, "jev_model": model, "ms": elapsed_ms, "settings": settings, "decisions": decisions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
     try:

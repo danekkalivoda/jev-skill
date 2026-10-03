@@ -4,6 +4,12 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+- Add user settings in `~/.config/jev/settings.json` (or `JEV_SETTINGS`), overridden by the nearest `.jev.json` of a project. No file means the routing is unchanged.
+- `quality` (-2 to 2) moves every decision: lower takes cheaper tiers more often, +1 turns off the cost-saving drops, +2 also needs 90% coverage.
+- `topics` gives a subject a weight from 0 to 4 and asks Jev one extra question per task. `security` is built in; other topics need a description. A match blocks the drops (1), raises to tier 2 (2), to tier 3 when Jev gives it 20% or more (3), or always to tier 3 (4).
+- Add `topics` to each decision and `settings` (with `warnings`) to the output. A bad setting is skipped with a warning.
+- When a drop is blocked, the reason says so: `kept tier N (topic security)` or `(quality +1)`.
+
 ## 1.2.0
 
 - Add `JEV_PROVIDER` to choose who serves the judgment model: `typesafe` (default, unchanged), `openrouter` (`OPENROUTER_API_KEY`), or `local` (a System One compatible server at `JEV_LOCAL_URL`, model `nimble`).

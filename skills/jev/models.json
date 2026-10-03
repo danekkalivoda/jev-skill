@@ -80,7 +80,29 @@
     "frontier_coverage": 0.4,
     "frontier_risky_guard": 0.7,
     "skill_hint_confidence": 0.7,
-    "skill_hint_timeout_seconds": 4
+    "skill_hint_timeout_seconds": 4,
+    "allow_drops": true,
+    "topic_threshold": 0.6,
+    "topic_frontier_share": 0.2
+  },
+  "quality_levels": {
+    "-2": {
+      "coverage": 0.7
+    },
+    "-1": {
+      "coverage": 0.75
+    },
+    "0": {},
+    "1": {
+      "allow_drops": false
+    },
+    "2": {
+      "allow_drops": false,
+      "coverage": 0.9
+    }
+  },
+  "topics": {
+    "security": "security-sensitive work: authentication, authorization or permissions, sessions or tokens, secrets or credentials, input validation or injection, cryptography, or a security review or audit"
   },
   "codex_fallback_generation": "6"
 }
