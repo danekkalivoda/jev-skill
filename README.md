@@ -93,6 +93,7 @@ A bad file or value is skipped and reported in the output field `settings.warnin
 
 Every routing decision is appended to `~/.local/state/jev/decisions.jsonl`.
 Set `JEV_LOG` to write somewhere else.
+Each line is one call: `ts`, `cwd`, `tasks` (the input), then the output fields (`source`, `provider`, `jev_model`, `ms`, `settings`, `decisions`). `provider` came in 1.2.0, `settings` in 1.3.0; older lines lack them.
 
 ## Versions
 
