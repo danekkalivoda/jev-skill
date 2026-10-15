@@ -43,8 +43,22 @@ The tier thresholds in `models.json` were calibrated on Jev. With `local` they a
 so treat its tiers as experimental. Skill hints are off for `local` when more than 25 skills are installed.
 `local` is also slower: it rates one question at a time, about 3 seconds per task on an M1 Max.
 
-If the chosen provider is not set up or not reachable, `route.py` does not switch to another one.
-It returns the fallback tier and says why.
+`local` has a safety net. Before the first question `route.py` checks that the server answers (about 1.5 seconds at most),
+and each question gets 8 seconds. If local is down or fails and `TYPESAFE_API_KEY` is set, the whole wave goes to TypeSafe instead.
+The output and the log then say `"provider": "typesafe"`, and each decision's `reasons` says local was skipped.
+The numbers live in the `local` entry of `models.json` (`fallback_provider`, `connect_timeout_seconds`, `policy`).
+If there is no other provider to use, `route.py` returns the fallback tier and says why.
+
+### Task fields
+
+Each task has `id` and `brief`. These are optional:
+
+| Field | Meaning |
+| --- | --- |
+| `attempt` | Number of failed tries so far. Each one adds a tier. |
+| `prev_tier` | 0 to 3. The tier that just failed. With `attempt` above 0 the retry goes to at least `prev_tier + 1` instead of adding `attempt` to a fresh rating. Ask the user only when `prev_tier` is 3. |
+| `min_tier`, `min_tier_reason` | A floor set by the orchestrator. |
+| `max_tier`, `max_tier_reason` | A cap, for when the user asks for a cheaper model. Applied last, and it wins over `min_tier`. The reason goes into `reasons`. |
 
 ## Settings
 

@@ -2,12 +2,17 @@
 """Pick a model tier for each delegated task, using TypeSafe Jev.
 
 Input (stdin, JSON):
-  {"tasks": [{"id": "a", "brief": "English task description", "attempt": 0, "min_tier": null, "min_tier_reason": null}]}
+  {"tasks": [{"id": "a", "brief": "English task description", "attempt": 0, "prev_tier": null,
+              "min_tier": null, "min_tier_reason": null, "max_tier": null, "max_tier_reason": null}]}
+All fields except id and brief are optional. prev_tier (0-3) is the tier that failed: a retry then goes to at least
+prev_tier + 1. max_tier (0-3) caps the result when the user asked for a cheaper model; it wins over min_tier.
 Output (stdout, JSON): one decision per task, with the model to use in Claude Code and in Codex,
 plus "skill_hint": {"name", "confidence"} naming an installed skill the sub-agent could load, or null.
 
 Jev only judges the task. Code owns the policy: coverage threshold, floors, retries, model table.
 JEV_PROVIDER picks who serves the judgment model: typesafe (default), openrouter, or local (see models.json).
+A provider with "fallback_provider" (local) is checked for reachability first; if it is down or fails and the
+fallback has its key, the whole wave is asked there instead, and the output names the provider actually used.
 User settings (~/.config/jev/settings.json, .jev.json) can add a quality level and weighted topics; see README.
 Stdlib only, so it runs the same under Claude Code, Codex, or any other agent.
 """
@@ -17,9 +22,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -89,12 +96,24 @@ def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
     return quality, topics, warnings
 
 
-PROVIDER_NAME = (load_setting("JEV_PROVIDER") or "typesafe").lower()
-PROVIDER = CONFIG["providers"].get(PROVIDER_NAME)  # None for an unknown name; endpoint() reports it
 QUALITY, TOPICS, SETTINGS_WARNINGS = load_user_settings()
-# A provider may override policy numbers, because thresholds calibrated on one model do not carry over to another.
-# The user's quality level goes on top: it trades cost for safety the same way on every provider.
-POLICY = {**CONFIG["policy"], **(PROVIDER or {}).get("policy", {}), **CONFIG["quality_levels"][str(QUALITY)]}
+
+
+def policy_for(provider: dict | None) -> dict:
+    # A provider may override policy numbers, because thresholds calibrated on one model do not carry over to another.
+    # The user's quality level goes on top: it trades cost for safety the same way on every provider.
+    return {**CONFIG["policy"], **(provider or {}).get("policy", {}), **CONFIG["quality_levels"][str(QUALITY)]}
+
+
+def use_provider(name: str) -> None:
+    """Make `name` the active provider. main() calls it again when the wave moves to a fallback provider."""
+    global PROVIDER_NAME, PROVIDER, POLICY
+    PROVIDER_NAME = name
+    PROVIDER = CONFIG["providers"].get(name)  # None for an unknown name; endpoint() reports it
+    POLICY = policy_for(PROVIDER)
+
+
+use_provider((load_setting("JEV_PROVIDER") or "typesafe").lower())
 TIERS = CONFIG["tiers"]
 MAX_TIER = len(TIERS) - 1
 LOG = Path(os.environ.get("JEV_LOG", Path.home() / ".local/state/jev/decisions.jsonl"))
@@ -131,6 +150,27 @@ def endpoint() -> tuple[str, dict, str]:
             raise RuntimeError(f"{PROVIDER['key_env']} not found in env or shell profile")
         headers["Authorization"] = f"Bearer {key}"
     return url, headers, PROVIDER["model"]
+
+
+def reachable(url: str, timeout: float) -> bool:
+    """Quick TCP connect to the provider's host. A dead tunnel then costs ~1 s instead of a full request timeout."""
+    parts = urllib.parse.urlsplit(url)
+    try:
+        with socket.create_connection((parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def fallback_name() -> str | None:
+    """Name of the active provider's fallback, only when that provider is set up (its key is available)."""
+    name = (PROVIDER or {}).get("fallback_provider")
+    other = CONFIG["providers"].get(name or "")
+    if other is None or name == PROVIDER_NAME:
+        return None
+    if "key_env" in other and not load_setting(other["key_env"]):
+        return None
+    return name
 
 
 def latest_codex_model(family: str) -> str:
@@ -209,7 +249,8 @@ def post_questions(target: tuple[str, dict, str], questions: dict) -> dict:
     body = json.dumps({"state": STATE, "model": model, "questions": questions}).encode()
     request = urllib.request.Request(url, data=body, headers=headers)
     last_error: Exception | None = None
-    for attempt in range(3):
+    attempts = POLICY.get("request_attempts", 3)
+    for attempt in range(attempts):
         try:
             with urllib.request.urlopen(request, timeout=POLICY["timeout_seconds"]) as response:
                 return json.loads(response.read())
@@ -219,7 +260,8 @@ def post_questions(target: tuple[str, dict, str], questions: dict) -> dict:
                 break
         except (urllib.error.URLError, TimeoutError) as error:
             last_error = error
-        time.sleep(0.5 * 2**attempt)
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * 2**attempt)
     raise RuntimeError(f"Jev request failed: {last_error}")
 
 
@@ -341,9 +383,15 @@ def smallest_covering_tier(probabilities: dict[str, float]) -> int:
     return MAX_TIER
 
 
-def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict | None = None) -> dict:
+def tier_input(task: dict, name: str) -> int | None:
+    """A tier number 0..MAX_TIER from the task, or None when missing or not valid."""
+    value = task.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TIER else None
+
+
+def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict | None = None, notices: list[str] | None = None) -> dict:
     tid = task["id"]
-    reasons: list[str] = []
+    reasons: list[str] = list(notices or [])
     risky = unclear = None
     score = confidence = None
     topic_scores: dict[str, float] | None = None
@@ -405,14 +453,38 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
         reasons.append(f"orchestrator floor tier {min_tier}: {task.get('min_tier_reason') or 'no reason given'}")
 
     attempt = int(task.get("attempt") or 0)
+    prev_tier = tier_input(task, "prev_tier")
     escalate_to_user = False
-    if attempt > 0:
+    if attempt > 0 and prev_tier is not None:
+        # The brief of a retry is longer, so Jev rates it higher than the first try. Step up from the tier that
+        # failed instead, but never below what the rules above ask for.
+        if prev_tier >= MAX_TIER:
+            escalate_to_user = True
+            reasons.append(f"retry {attempt}: tier {prev_tier} already failed, top tier: ask the user before retrying")
+        elif tier <= prev_tier:
+            tier = prev_tier + 1
+            reasons.append(f"retry {attempt}: tier {prev_tier} failed, next tier {tier}")
+        else:
+            reasons.append(f"retry {attempt}: tier {prev_tier} failed, kept tier {tier} (already above it)")
+    elif attempt > 0:
         tier += attempt
         reasons.append(f"retry {attempt}: +{attempt} tier")
         if tier > MAX_TIER:
             escalate_to_user = True
             reasons.append("already failed at the top tier: ask the user before retrying")
     tier = min(tier, MAX_TIER)
+
+    # Last word: the user explicitly asked for a cheaper model, so it beats the floor and the retry step.
+    max_tier = tier_input(task, "max_tier")
+    if max_tier is not None:
+        why = task.get("max_tier_reason") or "no reason given"
+        if isinstance(min_tier, int) and min_tier > max_tier:
+            reasons.append(f"max tier {max_tier} overrides orchestrator floor tier {min_tier}: user's explicit wish")
+        if tier > max_tier:
+            tier = max_tier
+            reasons.append(f"user cap tier {max_tier}: {why}: lowered to tier {tier}")
+        else:
+            reasons.append(f"user cap tier {max_tier}: {why}: not needed")
 
     row = TIERS[tier]
     return {
@@ -446,32 +518,67 @@ def main() -> int:
 
     started = time.monotonic()
     answers = error = model = None
+    notices: list[str] = []
     # Skill hints run in parallel with the tier request. They are optional: errors become null, and they get
     # only their own short deadline, so they can never change or noticeably delay the tier output.
-    skill_deadline = started + POLICY["skill_hint_timeout_seconds"]
     pool = ThreadPoolExecutor(max_workers=len(tasks) + 1)
     hint_futures: dict = {}
-    try:
-        target = endpoint()
-        skills = installed_skills()
-        # Some providers cap the number of choices; the hint is optional, so it is skipped rather than cut down.
-        if skills and len(skills) < PROVIDER.get("max_choices", 255):
-            criteria = {name: short_description(text) or "(no description)" for name, text in sorted(skills.items())}
-            criteria[SKILL_NONE] = SKILL_NONE_DESC
-            hint_futures = {task["id"]: pool.submit(ask_skill_hint, target, task["brief"], criteria, skill_deadline) for task in tasks}
-    except Exception:
+    skill_deadline = started
+
+    def start_hints() -> None:
+        nonlocal hint_futures, skill_deadline
+        skill_deadline = time.monotonic() + POLICY["skill_hint_timeout_seconds"]
         hint_futures = {}
-    try:
-        response = pool.submit(ask_jev, tasks).result()
-        answers, model = response["answers"], response.get("model")
-    except Exception as exc:  # any failure falls back to the default tier, never blocks the orchestrator
-        error = str(exc)
+        try:
+            target = endpoint()
+            skills = installed_skills()
+            # Some providers cap the number of choices; the hint is optional, so it is skipped rather than cut down.
+            if skills and len(skills) < PROVIDER.get("max_choices", 255):
+                criteria = {name: short_description(text) or "(no description)" for name, text in sorted(skills.items())}
+                criteria[SKILL_NONE] = SKILL_NONE_DESC
+                hint_futures = {task["id"]: pool.submit(ask_skill_hint, target, task["brief"], criteria, skill_deadline) for task in tasks}
+        except Exception:
+            hint_futures = {}
+
+    def switch_to_fallback(name: str, why: str) -> None:
+        nonlocal error
+        notices.append(f"provider {PROVIDER_NAME} skipped ({why}): asked {name} instead")
+        use_provider(name)
+        error = None
+
+    # A provider with a connect timeout (local, often behind a VPN) is probed first, so a dead link costs about a second.
+    fallback = fallback_name()
+    connect_timeout = (PROVIDER or {}).get("connect_timeout_seconds")
+    if connect_timeout:
+        try:
+            up, why = reachable(endpoint()[0], connect_timeout), f"no connection within {connect_timeout}s"
+        except Exception as exc:
+            up, why = False, str(exc)
+        if not up and fallback:
+            switch_to_fallback(fallback, why)
+            fallback = None
+        elif not up:
+            error = f"{PROVIDER_NAME} unreachable ({why})"
+    for _ in range(2):
+        if error:
+            break
+        start_hints()
+        try:
+            response = pool.submit(ask_jev, tasks).result()
+            answers, model = response["answers"], response.get("model")
+            break
+        except Exception as exc:  # any failure falls back to the default tier, never blocks the orchestrator
+            error = str(exc)
+            if not fallback:
+                break
+            switch_to_fallback(fallback, error)
+            fallback = None
     if answers is not None:  # after the tier answer, wait at most a short grace (and never past the hint deadline)
         hint_wait_until = min(skill_deadline, time.monotonic() + SKILL_HINT_GRACE_SECONDS)
         wait(list(hint_futures.values()), timeout=max(0.0, hint_wait_until - time.monotonic()))
     skill_hints = {tid: future.result() if future.done() and not future.exception() else None for tid, future in hint_futures.items()}
     pool.shutdown(wait=False)
-    decisions = [decide(task, answers, error, skill_hints.get(task["id"])) for task in tasks]
+    decisions = [decide(task, answers, error, skill_hints.get(task["id"]), notices) for task in tasks]
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     settings = {"quality": QUALITY, "topics": {name: weight for name, (weight, _) in TOPICS.items()}, "warnings": SETTINGS_WARNINGS}

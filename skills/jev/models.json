@@ -17,8 +17,11 @@
       "one_question_per_request": true,
       "policy": {
         "low_confidence_threshold": 0,
-        "timeout_seconds": 15
-      }
+        "timeout_seconds": 8,
+        "request_attempts": 1
+      },
+      "fallback_provider": "typesafe",
+      "connect_timeout_seconds": 1.5
     }
   },
   "tiers": [

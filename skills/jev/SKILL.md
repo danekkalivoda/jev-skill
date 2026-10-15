@@ -25,15 +25,17 @@ You do not pick models by feel. That is the point of this skill: orchestrators p
    - No long lists of edge cases to make it look thorough. Name the files and the done condition.
    - Do not play down a real hard part either. Leaving out a true `Hard part:` sends a hard task to a weaker model.
    Do not put counts or math in it for Jev to weigh.
-3. **Route** the whole wave in one call:
+3. **Route** the whole wave in one call. Reviews, critics, advisors and fix waves are tasks too: route them like any other.
+   Do not route a lone small follow-up fix (a few lines, cause known). Send it to the subagent that did that work with SendMessage.
    ```bash
    python3 ~/.agents/skills/jev/route.py <<'EOF'
    {"tasks": [
      {"id": "find-usages", "brief": "..."},
-     {"id": "fix-bug", "brief": "...", "attempt": 0}
+     {"id": "fix-bug", "brief": "...", "attempt": 1, "prev_tier": 1}
    ]}
    EOF
    ```
+   `attempt` and `prev_tier` are for a retry only (see step 6). Leave them out on a first try.
 4. **Act on each decision** before spawning:
    - `clarify_first: true` - the brief is too vague. Sharpen it from what you know, or ask the user. Then route again.
    - `escalate_to_user: true` - it already failed on the top tier. Stop and ask the user.
@@ -43,8 +45,10 @@ You do not pick models by feel. That is the point of this skill: orchestrators p
    (for example a skill that writes files for a read-only task).
 5. **Verify** each result yourself, cheaply: read the diff, run the relevant check. Do not trust a subagent's "done".
    `risky` of 0.7 or more means verification is mandatory and should be thorough.
-6. **On failure**, route the same task again with `"attempt": 1` (then 2). Code raises the tier by one per attempt.
+6. **On failure** (the subagent could not do the task), route it again with `"attempt": 1` and `"prev_tier": <tier that failed>`.
+   The new tier is at least `prev_tier` + 1. It escalates to the user only when `prev_tier` was 3.
    Improve the brief with what you learned from the failure.
+   A fix round after a review is not a failure. Send the review findings back to the same subagent with SendMessage. Do not route a new task.
 7. **Integrate** and report to the user: what was done, which tiers ran, what failed and why.
 
 ## Spawning
@@ -60,11 +64,14 @@ Use the column for the harness you are running in. Put the brief (plus any conte
 
 ## Overrides
 
-- Never pick a cheaper model than the router says.
+- Never pick a cheaper model on your own.
 - When Jev's confidence is below `low_confidence_threshold` (0.3 in `models.json`), `route.py` already drops the tier by one; the risky floor still applies afterwards. Do not drop it further by hand.
 - When a task lands on tier 2 but Jev gives tier 0 or 1 a probability of `standard_coverage` (0.15) or more, `route.py` takes tier 1, unless `risky` is `standard_risky_guard` (0.4) or higher. Do not undo it with `min_tier` without a concrete reason.
 - When a task lands on tier 3 but Jev gives tiers 0-2 a probability of `frontier_coverage` (0.4) or more, `route.py` takes tier 2, unless `risky` is `frontier_risky_guard` (0.7) or higher. Same rule: no `min_tier` without a concrete reason.
 - You may raise a task: add `"min_tier": N, "min_tier_reason": "..."` to its input. The reason is logged. Use it rarely and say why.
+- When the user asks for a model, it applies to the task they said it about, not the rest of the session. Pass it in the task input:
+  `min_tier` (up) or `"max_tier": N, "max_tier_reason": "..."` (down, applied last), with the user's words as the reason.
+  Only "always" or "everywhere" from the user makes it last longer. Do not carry it into context summaries as a standing rule.
 - The user's settings (`~/.config/jev/settings.json`, or the nearest `.jev.json` up from the working directory) can make routing more careful.
   `quality` +1 or +2 keeps the drops above from firing; -1 or -2 lets more tasks take a cheaper tier.
   A weighted topic (for example `security`) gets its own Jev question; the score is in `topics`, and a match blocks the drops (weight 1),
@@ -75,6 +82,8 @@ Use the column for the harness you are running in. Put the brief (plus any conte
 ## What you still do yourself
 
 Only work that is part of orchestrating: reading enough code to write good briefs, reading results, running verification checks, small glue edits between task results.
+Glue edits are a few lines that join subagent results. Anything more goes to a subagent.
+Never edit project code through Bash (heredoc python writing files, `sed -i`, `echo >`, and so on). That is doing the real work while hiding it.
 If you notice you are doing a task's real work, stop and delegate it.
 
 ## Rules carried into every subagent prompt
