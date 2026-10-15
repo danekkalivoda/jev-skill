@@ -4,6 +4,8 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+## 1.4.0
+
 - Add optional task input `prev_tier` (0-3): a retry goes to at least `prev_tier + 1` instead of adding `attempt` to a fresh rating of the longer brief. `escalate_to_user` only when `prev_tier` is 3. Without it, retries work as before.
 - Add optional task inputs `max_tier` and `max_tier_reason`: a cap applied after floors, topics and retries. It wins over `min_tier` and the reason is logged.
 - `local` provider: quick reachability check (`connect_timeout_seconds`), shorter per-question timeout (8 s, one attempt), and if local is down or fails the wave is retried on `typesafe` when `TYPESAFE_API_KEY` is set. Output and log `provider` name the one actually used; `reasons` say local was skipped. New keys in `models.json`: `fallback_provider`, `connect_timeout_seconds`, `policy.request_attempts`.
