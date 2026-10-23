@@ -62,7 +62,8 @@
       "tier": 3,
       "label": "frontier",
       "claude": {
-        "model": "fable"
+        "model": "fable",
+        "fallback": ["opus"]
       },
       "codex": {
         "family": "astra",

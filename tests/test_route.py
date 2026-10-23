@@ -89,6 +89,12 @@ class DefaultRouting(unittest.TestCase):
         self.assertEqual(decision["codex"], {"model": "gpt-6-sol", "reasoning_effort": "high"})
 
 
+    def test_frontier_claude_fallback(self):
+        decision = self.tier(probabilities=FRONTIER)
+        self.assertEqual(decision["tier"], 3)
+        self.assertEqual(decision["claude"]["fallback"], ["opus"])
+
+
 class RetryAndCap(unittest.TestCase):
     def decide(self, task, probabilities=STANDARD, **kwargs):
         return route.decide({"id": "t", **task}, answers(probabilities, **kwargs), None)

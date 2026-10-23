@@ -4,6 +4,8 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+- Add optional `claude.fallback` key in `models.json` (tier 3: `["opus"]`): models to try in order when the top model is not available on the subscription. SKILL.md tells the orchestrator to retry with the next one and stick with it.
+
 ## 1.4.0
 
 - Add optional task input `prev_tier` (0-3): a retry goes to at least `prev_tier + 1` instead of adding `attempt` to a fresh rating of the longer brief. `escalate_to_user` only when `prev_tier` is 3. Without it, retries work as before.

@@ -50,6 +50,7 @@ You do not pick models by feel. That is the point of this skill: orchestrators p
    Improve the brief with what you learned from the failure.
    A fix round after a review is not a failure. Send the review findings back to the same subagent with SendMessage. Do not route a new task.
 7. **Integrate** and report to the user: what was done, which tiers ran, what failed and why.
+   If a fallback model was used, say once which model ran instead.
 
 ## Spawning
 
@@ -58,13 +59,16 @@ Use the column for the harness you are running in. Put the brief (plus any conte
 **Claude Code** (Agent tool):
 - Pass `model` from `claude.model` and choose the subagent_type that fits the task
   (`Explore` for read-only search, a project agent such as `backend-developer`, or `general-purpose`).
+- If `claude.fallback` is present, it lists models to try in order. Use it only when the Agent call fails with an error saying the model is not available or not permitted for this account. Retry with the next one, and keep using that model for the rest of the session instead of the unavailable one.
+  Rate limits, overload, timeouts and other errors are not a reason to fall back: retry the same model or report.
+  This is not a task failure (step 6): do not route again or set `attempt`/`prev_tier`. If no fallback model is left, ask the user.
 
 **Codex** (`spawn_agent`):
 - Pass `model` and `reasoning_effort` from `codex`. Use `agent_type: "explorer"` for read-only tasks and `"worker"` for tasks that write.
 
 ## Overrides
 
-- Never pick a cheaper model on your own.
+- Never pick a cheaper model on your own. The only exception is `claude.fallback` (see Spawning).
 - When Jev's confidence is below `low_confidence_threshold` (0.3 in `models.json`), `route.py` already drops the tier by one; the risky floor still applies afterwards. Do not drop it further by hand.
 - When a task lands on tier 2 but Jev gives tier 0 or 1 a probability of `standard_coverage` (0.15) or more, `route.py` takes tier 1, unless `risky` is `standard_risky_guard` (0.4) or higher. Do not undo it with `min_tier` without a concrete reason.
 - When a task lands on tier 3 but Jev gives tiers 0-2 a probability of `frontier_coverage` (0.4) or more, `route.py` takes tier 2, unless `risky` is `frontier_risky_guard` (0.7) or higher. Same rule: no `min_tier` without a concrete reason.
