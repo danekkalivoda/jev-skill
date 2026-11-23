@@ -4,6 +4,11 @@ All notable changes to the jev skill. Newest first.
 
 ## Unreleased
 
+- Add the `agents` setting (user file and `.jev.json`): per tier, run the task on Claude or Codex, with an optional model and effort; `read_only` tiers; `claude_only` topics and task kinds (reviews, checks, critics, advisors stay on Claude by default); `fallback`. It never changes the tier.
+- Add decision fields `agent`, `model`, `effort` and `alternate` (the other agent, for a subscription limit only), and `settings.agents`. Without the section: `agent` is `claude`, `alternate` null, everything else as before. `claude` and `codex` are unchanged.
+- Add optional task inputs `kind`, `read_only`, `agent` and `agent_reason`. Kinds match by word (`code-review`), a topic without a score stays on Claude, tasks under an exception never get an `alternate`, and a bad or overriding task `agent` adds a warning. Full `claude-...` model names in `agents` are refused (aliases only). Bad `agents` values are skipped with a warning in `settings.warnings`. The chosen agent and why go into `reasons` and so into the decision log.
+- New `agents` block in `models.json` (known models, efforts, default Claude-only kinds). SKILL.md explains how to start Codex, in Orca too.
+
 ## 1.5.0
 
 - Add optional `claude.fallback` key in `models.json` (tier 3: `["opus"]`): models to try in order when the top model is not available on the subscription. SKILL.md tells the orchestrator to retry with the next one and stick with it.

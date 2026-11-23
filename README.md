@@ -59,6 +59,9 @@ Each task has `id` and `brief`. These are optional:
 | `prev_tier` | 0 to 3. The tier that just failed. With `attempt` above 0 the retry goes to at least `prev_tier + 1` instead of adding `attempt` to a fresh rating. Ask the user only when `prev_tier` is 3. |
 | `min_tier`, `min_tier_reason` | A floor set by the orchestrator. |
 | `max_tier`, `max_tier_reason` | A cap, for when the user asks for a cheaper model. Applied last, and it wins over `min_tier`. The reason goes into `reasons`. |
+| `kind` | What the task is. Any word of it that is a listed kind counts (`Review `, `code-review`). `review`, `check`, `critic` or `advisor` stay on Claude when agent settings send work to Codex (see [Agents](#agents-claude-or-codex)). |
+| `read_only` | `true` when the task changes no files. Can use its own agent settings. |
+| `agent`, `agent_reason` | `claude` or `codex`: the user asked for this agent for this task. Wins over the settings. |
 
 ## Settings
 
@@ -99,6 +102,45 @@ create `~/.config/jev/settings.json`:
 { "topics": { "money": { "weight": 2, "description": "payments, invoices, prices or other handling of money" } } }
 ```
 
+### Agents: Claude or Codex
+
+By default every task goes to Claude. The `agents` section sends tasks to Codex (your ChatGPT subscription) instead.
+It only picks who runs the task. The tier is chosen first and never changes because of it.
+
+```json
+{
+  "agents": {
+    "default": "claude",
+    "tiers": {
+      "0": "codex",
+      "1": { "agent": "codex", "model": "sol", "effort": "medium" },
+      "2": "claude",
+      "3": "claude"
+    },
+    "read_only": { "tiers": { "2": "codex" } },
+    "claude_only": { "topics": ["security", "visual"], "kinds": ["review", "check", "critic", "advisor"] },
+    "fallback": true
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `default` | Agent for a tier not listed in `tiers`. Default `claude`. |
+| `tiers` | Per tier `"0"` to `"3"`: an agent name, or an object with `agent` and optional `model` and `effort`. A Claude `model` is `haiku`, `sonnet`, `opus` or `fable` (full `claude-...` names are refused with a warning, because Claude Code's Agent tool takes only these aliases). A Codex `model` is a family (`luna`, `sol`, `astra`, `terra`, resolved to the newest listed one) or a full `gpt-...` name. Without `model` or `effort` the tier's own model from `models.json` is used. Efforts: Claude `low` to `max`, Codex `low` to `ultra`. |
+| `read_only` | Same `tiers`, used instead for tasks with `"read_only": true`. Tiers not listed there use the main `tiers`. |
+| `claude_only.topics` | Topics (they must have a weight above 0 in `topics`) that always stay on Claude when Jev's score reaches the topic threshold. If Jev is down, topic scores are unknown and the task stays on Claude. Default none. |
+| `claude_only.kinds` | Task kinds that always stay on Claude. Default `review`, `check`, `critic`, `advisor`. `[]` turns it off. |
+| `fallback` | `true` (default): each decision names an `alternate` agent for the case where the chosen one hits its subscription limit. `false`: no alternate. |
+
+A task that hits an exception has `alternate: null`, whichever agent the tier names, so a limit on Claude never moves it to Codex. A topic with no score (Jev down or no answer) counts as a match. An explicit task `agent` beats the exceptions; overriding one adds a warning, and so does an `agent` that is not `claude` or `codex`.
+The same keys in a project `.jev.json` win over the user file: `tiers` merge tier by tier, lists and `fallback` are replaced.
+
+Each decision then has `agent` (`claude` or `codex`), `model`, `effort` (null when not set), and `alternate`
+(`{"agent", "model", "effort"}` of the other agent, or null when `fallback` is off, an exception applies, or the task named its agent).
+`claude` and `codex` stay as before. `reasons` says why the agent was chosen, and the decision log keeps it for comparing the two.
+Without an `agents` section: `agent` is `claude`, `alternate` is null, and nothing else changes.
+
 A project can have its own `.jev.json` in its root. Its values win over the user file; topics are merged.
 Set `JEV_SETTINGS` to read the user settings from another path.
 A bad file or value is skipped and reported in the output field `settings.warnings`; routing goes on.
@@ -108,6 +150,7 @@ A bad file or value is skipped and reported in the output field `settings.warnin
 Every routing decision is appended to `~/.local/state/jev/decisions.jsonl`.
 Set `JEV_LOG` to write somewhere else.
 Each line is one call: `ts`, `cwd`, `tasks` (the input), then the output fields (`source`, `provider`, `jev_model`, `ms`, `settings`, `decisions`). `provider` came in 1.2.0, `settings` in 1.3.0; older lines lack them.
+Since 1.6.0 each decision has `agent`, `model`, `effort` and `alternate`; with agent settings, `reasons` holds an `agent ...` line saying why.
 
 ## Versions
 

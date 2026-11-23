@@ -54,17 +54,36 @@ You do not pick models by feel. That is the point of this skill: orchestrators p
 
 ## Spawning
 
-Use the column for the harness you are running in. Put the brief (plus any context the subagent needs) in the prompt.
+Every decision names the agent to start: `agent` (`claude` or `codex`), with `model` and `effort` to pass. Use these three fields, not `claude` or `codex`.
+Without user settings `agent` is always `claude`, so nothing changes. Do not choose the agent yourself.
+Tell `route.py` what the task is, so the user's rules can apply: add `"kind": "review"` (also `check`, `critic`, `advisor`) to a task that judges someone's work,
+and `"read_only": true` to a task that changes no files. Add `"agent": "claude"` or `"codex"` with `"agent_reason"` only when the user asked for that agent for this task.
 
-**Claude Code** (Agent tool):
-- Pass `model` from `claude.model` and choose the subagent_type that fits the task
+**agent = claude, in Claude Code** (Agent tool):
+- Pass `model` and choose the subagent_type that fits the task
   (`Explore` for read-only search, a project agent such as `backend-developer`, or `general-purpose`).
+- Pass `effort` only when it is not null.
 - If `claude.fallback` is present, it lists models to try in order. Use it only when the Agent call fails with an error saying the model is not available or not permitted for this account. Retry with the next one, and keep using that model for the rest of the session instead of the unavailable one.
   Rate limits, overload, timeouts and other errors are not a reason to fall back: retry the same model or report.
   This is not a task failure (step 6): do not route again or set `attempt`/`prev_tier`. If no fallback model is left, ask the user.
 
-**Codex** (`spawn_agent`):
-- Pass `model` and `reasoning_effort` from `codex`. Use `agent_type: "explorer"` for read-only tasks and `"worker"` for tasks that write.
+**agent = claude, in Orca**: `orca orchestration worker-start --agent claude --model <model> --worktree current --task-title "SUB: ..." --spec "<brief>"`.
+The model is an alias (`haiku`, `sonnet`, `opus`, `fable`); Claude Code's Agent tool and Orca take only aliases. Add `--effort <effort>` only when `effort` is not null.
+
+**agent = codex, from Claude Code or Orca** (the Codex CLI is installed and logged in on the user's machine):
+- In Orca: `orca orchestration worker-start --agent codex --model <model> --effort <effort> --worktree current --task-title "SUB: ..." --spec "<brief>"`.
+  Pass `--effort` only when `effort` is not null. Follow the project's Orca rules for the other flags.
+- Without Orca: `codex exec --model <model> -c model_reasoning_effort=<effort> "<brief>"` (add `--sandbox read-only` when `read_only` is true).
+
+**In Codex** (`spawn_agent`), when `agent` is `codex`:
+- Pass `model` and `reasoning_effort` (the `effort` field). Use `agent_type: "explorer"` for read-only tasks and `"worker"` for tasks that write.
+  If `agent` is `claude`, there is no Codex-native way to start it; start it through the harness you have for Claude, or tell the user.
+
+**alternate** is the other agent, with its model and effort, for one case only: the chosen agent stopped because the user's subscription limit or quota is used up
+(an error that says so, such as a usage limit or "try again at ..."). Then start the same brief on `alternate` and tell the user once.
+It is `null` when the user's rules forbid it (a review, a topic like security, an agent the user asked for) or when no agent settings exist. Then report the limit instead.
+Do not use `alternate` for any other error, and it is not a task failure: do not route again or set `attempt`/`prev_tier`.
+After one quota stop, keep sending that agent's tasks to the `alternate` for the rest of the session.
 
 ## Overrides
 
@@ -80,6 +99,7 @@ Use the column for the harness you are running in. Put the brief (plus any conte
   `quality` +1 or +2 keeps the drops above from firing; -1 or -2 lets more tasks take a cheaper tier.
   A weighted topic (for example `security`) gets its own Jev question; the score is in `topics`, and a match blocks the drops (weight 1),
   raises the task to tier 2 (weight 2), also to tier 3 when Jev gives tier 3 a real share (weight 3), or always to tier 3 (weight 4).
+  The `agents` section of the settings decides who runs a task (Claude or Codex, per tier, with exceptions); it never changes the tier.
   The output field `settings` shows what was applied. If `settings.warnings` is not empty, tell the user once. Do not edit the settings yourself.
 - If Jev is unreachable, `route.py` returns `"source": "fallback"` and tier 1 for everything. Tell the user once and continue.
 

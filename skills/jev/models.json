@@ -108,5 +108,14 @@
   "topics": {
     "security": "security-sensitive work: authentication, authorization or permissions, sessions or tokens, secrets or credentials, input validation or injection, cryptography, or a security review or audit"
   },
+  "agents": {
+    "claude_models": ["haiku", "sonnet", "opus", "fable"],
+    "codex_families": ["luna", "sol", "astra", "terra"],
+    "efforts": {
+      "claude": ["low", "medium", "high", "xhigh", "max"],
+      "codex": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    "claude_only_kinds": ["review", "check", "critic", "advisor"]
+  },
   "codex_fallback_generation": "6"
 }

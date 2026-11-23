@@ -3,10 +3,12 @@
 
 Input (stdin, JSON):
   {"tasks": [{"id": "a", "brief": "English task description", "attempt": 0, "prev_tier": null,
-              "min_tier": null, "min_tier_reason": null, "max_tier": null, "max_tier_reason": null}]}
+              "min_tier": null, "min_tier_reason": null, "max_tier": null, "max_tier_reason": null,
+              "kind": null, "read_only": false, "agent": null, "agent_reason": null}]}
 All fields except id and brief are optional. prev_tier (0-3) is the tier that failed: a retry then goes to at least
 prev_tier + 1. max_tier (0-3) caps the result when the user asked for a cheaper model; it wins over min_tier.
 Output (stdout, JSON): one decision per task, with the model to use in Claude Code and in Codex,
+plus "agent" ("claude" or "codex"), "model", "effort" and "alternate" (which agent to start, see the `agents` setting),
 plus "skill_hint": {"name", "confidence"} naming an installed skill the sub-agent could load, or null.
 
 Jev only judges the task. Code owns the policy: coverage threshold, floors, retries, model table.
@@ -51,8 +53,107 @@ def load_setting(name: str) -> str | None:
     return None
 
 
-def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
-    """Quality (-2..2), topics (name -> (weight 1..4, description)) and warnings from the user's settings files.
+AGENT_KEYS = {"default", "tiers", "read_only", "claude_only", "fallback"}
+
+
+def merge_agents(base: dict, new: dict) -> None:
+    """Merge one settings file's `agents` into the earlier ones: tiers per key, lists and scalars replaced."""
+    for key, value in new.items():
+        if key == "tiers" and isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key].update(value)
+        elif key in ("read_only", "claude_only") and isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge_agents(base[key], value)
+        else:
+            base[key] = value
+
+
+def parse_agent_spec(value, label: str, default_agent: str, warnings: list[str]) -> dict | None:
+    """One tier entry ("codex" or {"agent", "model", "effort"}) as {"agent", "model", "effort"}, or None with a warning."""
+    spec = {"agent": value} if isinstance(value, str) else value
+    if not isinstance(spec, dict):
+        warnings.append(f"{label}: must be an agent name or an object")
+        return None
+    agent = spec.get("agent", default_agent)
+    if agent not in ("claude", "codex"):
+        warnings.append(f"{label}: unknown agent {agent!r} (use claude or codex)")
+        return None
+    for key in spec.keys() - {"agent", "model", "effort"}:
+        warnings.append(f"{label}: unknown key {key}")
+    known = CONFIG["agents"]["claude_models"] if agent == "claude" else CONFIG["agents"]["codex_families"]
+    # Claude Code's Agent tool takes only the aliases, so a full claude-... name is not accepted. Codex takes full gpt-... names.
+    prefix = "gpt-" if agent == "codex" else None
+    model, effort = spec.get("model"), spec.get("effort")
+    if model is not None and not (isinstance(model, str) and (model in known or (prefix and model.startswith(prefix)))):
+        warnings.append(f"{label}: unknown {agent} model {model!r} (use {', '.join(known)}{' or a full name starting gpt-' if prefix else '; full claude-... names are not accepted'})")
+        return None
+    if effort is not None and effort not in CONFIG["agents"]["efforts"][agent]:
+        warnings.append(f"{label}: unknown {agent} effort {effort!r} (use {', '.join(CONFIG['agents']['efforts'][agent])})")
+        return None
+    return {"agent": agent, "model": model, "effort": effort}
+
+
+def parse_agent_tiers(raw, label: str, default_agent: str, warnings: list[str]) -> dict[int, dict]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        warnings.append(f"{label} must be an object")
+        return {}
+    tiers = {}
+    for key, value in raw.items():
+        if not (isinstance(key, str) and key.isdigit() and int(key) < len(CONFIG["tiers"])):
+            warnings.append(f"{label}: tier key {key} is not a tier number 0-{len(CONFIG['tiers']) - 1}")
+            continue
+        spec = parse_agent_spec(value, f"{label}: tier {key}", default_agent, warnings)
+        if spec:
+            tiers[int(key)] = spec
+    return tiers
+
+
+def parse_agents(raw: dict, topics: dict, warnings: list[str]) -> dict:
+    """Validate the merged `agents` settings. A bad value is dropped with a warning; no section means unconfigured."""
+    agents = {"configured": False, "default": "claude", "tiers": {}, "read_only_tiers": {}, "claude_only_topics": [],
+              "claude_only_kinds": list(CONFIG["agents"]["claude_only_kinds"]), "fallback": True}
+    if not raw:
+        return agents
+    agents["configured"] = True
+    for key in raw.keys() - AGENT_KEYS:
+        warnings.append(f"agents: unknown key {key}")
+    if "default" in raw:
+        if raw["default"] in ("claude", "codex"):
+            agents["default"] = raw["default"]
+        else:
+            warnings.append(f"agents.default: unknown agent {raw['default']!r} (use claude or codex)")
+    agents["tiers"] = parse_agent_tiers(raw.get("tiers"), "agents.tiers", agents["default"], warnings)
+    read_only = raw.get("read_only", {})
+    if isinstance(read_only, dict):
+        agents["read_only_tiers"] = parse_agent_tiers(read_only.get("tiers"), "agents.read_only.tiers", agents["default"], warnings)
+    else:
+        warnings.append("agents.read_only must be an object")
+    claude_only = raw.get("claude_only", {})
+    if isinstance(claude_only, dict):
+        for key, label in (("topics", "claude_only_topics"), ("kinds", "claude_only_kinds")):
+            if key not in claude_only:
+                continue
+            value = claude_only[key]
+            if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                agents[label] = [item.lower() if key == "kinds" else item for item in value]
+            else:
+                warnings.append(f"agents.claude_only.{key} must be a list of names")
+        for name in agents["claude_only_topics"]:
+            if name not in topics:
+                warnings.append(f"agents.claude_only.topics: topic {name} is not active (no weight above 0), so it cannot be checked")
+    else:
+        warnings.append("agents.claude_only must be an object")
+    if "fallback" in raw:
+        if isinstance(raw["fallback"], bool):
+            agents["fallback"] = raw["fallback"]
+        else:
+            warnings.append("agents.fallback must be true or false")
+    return agents
+
+
+def load_all_settings() -> tuple[int, dict[str, tuple[int, str]], dict, list[str]]:
+    """Quality (-2..2), topics (name -> (weight 1..4, description)), agent routing and warnings from the settings files.
 
     ~/.config/jev/settings.json (or JEV_SETTINGS) is read first, then the nearest .jev.json from the working
     directory upwards, whose values win. No files means quality 0 and no topics: the default routing.
@@ -64,7 +165,7 @@ def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
         if (folder / ".jev.json").is_file():
             paths.append(folder / ".jev.json")
             break
-    quality, raw_topics = 0, {}
+    quality, raw_topics, raw_agents = 0, {}, {}
     for path in paths:
         if not path.is_file():
             continue
@@ -83,6 +184,10 @@ def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
             raw_topics.update(data["topics"])
         elif "topics" in data:
             warnings.append(f"{path}: topics must be an object")
+        if isinstance(data.get("agents"), dict):
+            merge_agents(raw_agents, data["agents"])
+        elif "agents" in data:
+            warnings.append(f"{path}: agents must be an object")
     topics: dict[str, tuple[int, str]] = {}
     for name, value in raw_topics.items():
         weight, description = (value.get("weight"), value.get("description")) if isinstance(value, dict) else (value, None)
@@ -93,10 +198,16 @@ def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
             warnings.append(f"topic {name}: unknown topic needs a description")
         elif weight:
             topics[name] = (weight, description)
+    return quality, topics, parse_agents(raw_agents, topics, warnings), warnings
+
+
+def load_user_settings() -> tuple[int, dict[str, tuple[int, str]], list[str]]:
+    """Quality, topics and warnings only (the shape before agent routing existed)."""
+    quality, topics, _, warnings = load_all_settings()
     return quality, topics, warnings
 
 
-QUALITY, TOPICS, SETTINGS_WARNINGS = load_user_settings()
+QUALITY, TOPICS, AGENTS, SETTINGS_WARNINGS = load_all_settings()
 
 
 def policy_for(provider: dict | None) -> dict:
@@ -389,6 +500,60 @@ def tier_input(task: dict, name: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TIER else None
 
 
+def choose_agent(task: dict, tier: int, topic_scores: dict[str, float] | None) -> dict:
+    """Which agent runs a task of this tier, with model and effort, and the other agent to use if its quota runs out.
+
+    The tier is already final; this only maps it to an agent. Without an `agents` section the answer is Claude
+    with the tier's model and no alternate, as before. Exceptions (task input `agent`, `kind`, topics) win over tiers.
+    """
+    row = TIERS[tier]
+    defaults = {
+        "claude": {"agent": "claude", "model": row["claude"]["model"], "effort": None},
+        "codex": {"agent": "codex", "model": latest_codex_model(row["codex"]["family"]), "effort": row["codex"]["reasoning_effort"]},
+    }
+    if not AGENTS["configured"]:
+        return {**defaults["claude"], "alternate": None, "why": None, "warning": None}
+
+    def launch(spec: dict) -> dict:
+        out = dict(defaults[spec["agent"]])
+        model = spec.get("model")
+        if model:
+            out["model"] = latest_codex_model(model) if spec["agent"] == "codex" and not model.startswith("gpt-") else model
+        out["effort"] = spec.get("effort") or out["effort"]
+        return out
+
+    tiers = {**AGENTS["tiers"], **(AGENTS["read_only_tiers"] if task.get("read_only") is True else {})}
+    spec = tiers.get(tier, {"agent": AGENTS["default"]})
+    chosen, why = launch(spec), f"tier {tier} setting"
+    forced = task.get("agent")
+    warn = ""
+    if forced is not None and forced not in ("claude", "codex"):
+        warn = f"warning: task agent {forced!r} ignored (use claude or codex)"
+    # A kind matches when any word of it is a listed kind: "Review ", "code-review" and "review" all count.
+    words = set(re.findall(r"[a-z0-9]+", str(task.get("kind") or "").lower()))
+    kind = next((name for name in AGENTS["claude_only_kinds"] if name in words), None)
+    names = AGENTS["claude_only_topics"]
+    # A topic whose score is missing (Jev down, or no answer for that question) is unknown, and unknown stays on Claude.
+    unknown = [name for name in names if name not in (topic_scores or {})]
+    matched = [name for name in names if (topic_scores or {}).get(name, 0) >= POLICY["topic_threshold"]]
+    exception = None
+    if kind:
+        exception = f"kind {kind} stays on claude"
+    elif matched:
+        exception = f"topic {matched[0]} {topic_scores[matched[0]]} stays on claude"
+    elif unknown:
+        exception = f"topic {unknown[0]} unknown (no Jev answer): stays on claude"
+    pinned = False
+    if forced in ("claude", "codex"):
+        chosen, why, pinned = launch(spec if spec["agent"] == forced else {"agent": forced}), f"asked for {forced}: {task.get('agent_reason') or 'no reason given'}", True
+        if forced == "codex" and exception:
+            warn = f"warning: task asked for codex, overriding claude_only ({exception.replace(' stays on claude', '')})"
+    elif exception:
+        chosen, why, pinned = (chosen if chosen["agent"] == "claude" else defaults["claude"]), exception, True
+    other = defaults["claude" if chosen["agent"] == "codex" else "codex"]
+    return {**chosen, "alternate": None if pinned or not AGENTS["fallback"] else other, "why": why, "warning": warn or None}
+
+
 def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict | None = None, notices: list[str] | None = None) -> dict:
     tid = task["id"]
     reasons: list[str] = list(notices or [])
@@ -487,12 +652,21 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
             reasons.append(f"user cap tier {max_tier}: {why}: not needed")
 
     row = TIERS[tier]
+    agent = choose_agent(task, tier, topic_scores)
+    if agent["why"]:
+        reasons.append(f"agent {agent['agent']} ({agent['model']}): {agent['why']}")
+    if agent["warning"]:
+        reasons.append(agent["warning"])
     return {
         "id": tid,
         "tier": tier,
         "label": row["label"],
         "claude": row["claude"],
         "codex": {"model": latest_codex_model(row["codex"]["family"]), "reasoning_effort": row["codex"]["reasoning_effort"]},
+        "agent": agent["agent"],
+        "model": agent["model"],
+        "effort": agent["effort"],
+        "alternate": agent["alternate"],
         "risky": risky,
         "unclear": unclear,
         "clarify_first": unclear is not None and unclear >= POLICY["unclear_threshold"],
@@ -501,6 +675,20 @@ def decide(task: dict, answers: dict | None, error: str | None, skill_hint: dict
         "probabilities": None if answers is None else {k: round(v, 2) for k, v in probabilities.items()},
         "topics": topic_scores or None,
         "skill_hint": None if answers is None else skill_hint,
+    }
+
+
+def agents_summary() -> dict | None:
+    """The applied agent routing for the output (tier keys as strings), or None when the user set none."""
+    if not AGENTS["configured"]:
+        return None
+    named = lambda tiers: {str(tier): spec for tier, spec in sorted(tiers.items())}
+    return {
+        "default": AGENTS["default"],
+        "tiers": named(AGENTS["tiers"]),
+        "read_only_tiers": named(AGENTS["read_only_tiers"]),
+        "claude_only": {"topics": AGENTS["claude_only_topics"], "kinds": AGENTS["claude_only_kinds"]},
+        "fallback": AGENTS["fallback"],
     }
 
 
@@ -579,9 +767,10 @@ def main() -> int:
     skill_hints = {tid: future.result() if future.done() and not future.exception() else None for tid, future in hint_futures.items()}
     pool.shutdown(wait=False)
     decisions = [decide(task, answers, error, skill_hints.get(task["id"]), notices) for task in tasks]
+    task_warnings = [f"task {d['id']}: {line[len('warning: '):]}" for d in decisions for line in d["reasons"] if line.startswith("warning: ")]
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    settings = {"quality": QUALITY, "topics": {name: weight for name, (weight, _) in TOPICS.items()}, "warnings": SETTINGS_WARNINGS}
+    settings = {"quality": QUALITY, "topics": {name: weight for name, (weight, _) in TOPICS.items()}, "agents": agents_summary(), "warnings": SETTINGS_WARNINGS + task_warnings}
     output = {"source": "jev" if answers else "fallback", "provider": PROVIDER_NAME, "jev_model": model, "ms": elapsed_ms, "settings": settings, "decisions": decisions}
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
